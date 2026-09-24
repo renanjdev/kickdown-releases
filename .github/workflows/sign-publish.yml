@@ -1,0 +1,108 @@
+# Sign + publish a KICKDOWN release (docs/RELEASE.md in the private renanjdev/kickdown).
+#
+# The private repo's release workflow builds the installer WITHOUT any secret, creates the DRAFT vX.Y.Z
+# here (unsigned installer + notes.md) and dispatches this workflow. The job runs in the "release"
+# environment: it waits until the owner approves it (GitHub Mobile › Review deployments), and only then
+# gets the signing key. It never checks out the private code: the only script it runs is
+# scripts/release-manifest.mjs, copied from the private repo.
+#
+# No step prints a secret: no `set -x`, no echo of secret-derived values; the signer's output goes to
+# /dev/null.
+name: sign-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versão (x.y.z)"
+        required: true
+        type: string
+      tag:
+        description: "Tag (vX.Y.Z)"
+        required: true
+        type: string
+      tauri_cli:
+        description: "Versão do @tauri-apps/cli usada no build"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sign-publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  sign-publish:
+    name: assinar e publicar ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ inputs.tag }}
+      TAURI_CLI: ${{ inputs.tauri_cli }}
+      REPO: ${{ github.repository }}
+      # The app's updater pubkey (src-tauri/tauri.conf.json › plugins.updater.pubkey in the private repo).
+      UPDATER_PUBKEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFREUwRkZFRDU0NUZBNDgKUldSSStrWFYvZy9lanN0blBIc2oxQnhtOXBHMVFNbDgyTkxDL2Jvelh3VEUycDMwTGRlT0dST3MK
+    steps:
+      - name: Conferir entradas
+        run: |
+          set -euo pipefail
+          semver='^[0-9]+\.[0-9]+\.[0-9]+$'
+          if ! [[ "$VERSION" =~ $semver ]]; then echo "::error::version inválida"; exit 1; fi
+          if [ "$TAG" != "v$VERSION" ]; then echo "::error::tag $TAG ≠ v$VERSION"; exit 1; fi
+          if ! [[ "$TAURI_CLI" =~ $semver ]]; then echo "::error::tauri_cli inválida"; exit 1; fi
+          echo "INSTALLER=KICKDOWN_${VERSION}_x64-setup.exe" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      # Only a draft is signed: a published release is never touched again.
+      - name: Baixar o draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          draft=$(gh release view "$TAG" -R "$REPO" --json isDraft --jq .isDraft)
+          if [ "$draft" != "true" ]; then echo "::error::$TAG não é um draft (já publicada?)"; exit 1; fi
+          mkdir -p dist
+          gh release download "$TAG" -R "$REPO" -D dist -p "$INSTALLER" -p notes.md
+          test -s "dist/$INSTALLER"
+          if [ -z "$(tr -d '[:space:]' < dist/notes.md)" ]; then echo "::error::o draft $TAG não tem notas"; exit 1; fi
+
+      # Only the Tauri CLI (the same version the build used), without install scripts, in an empty
+      # folder: the key is exposed to this binary and nothing else.
+      - name: Tauri CLI ${{ inputs.tauri_cli }}
+        run: npm install --prefix "$RUNNER_TEMP/tauri-cli" --no-save --ignore-scripts --no-audit --no-fund "@tauri-apps/cli@$TAURI_CLI"
+
+      - name: Assinar o instalador
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
+            echo "::error::secrets do environment release ausentes"; exit 1
+          fi
+          "$RUNNER_TEMP/tauri-cli/node_modules/.bin/tauri" signer sign --app-version "$VERSION" "dist/$INSTALLER" > /dev/null
+
+      # Full minisign check against the app's pubkey + version:X.Y.Z in the signed comment.
+      - name: Conferir assinatura e gerar latest.json
+        run: >
+          node scripts/release-manifest.mjs --installer "dist/$INSTALLER" --version "$VERSION" --tag "$TAG"
+          --notes-file dist/notes.md --pubkey "$UPDATER_PUBKEY" --out out
+
+      - name: Publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" -R "$REPO" "dist/$INSTALLER.sig" out/latest.json
+          gh release edit "$TAG" -R "$REPO" --draft=false --latest
+          echo "publicado: https://github.com/$REPO/releases/tag/$TAG"
