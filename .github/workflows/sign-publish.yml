@@ -1,7 +1,7 @@
 # Sign + publish a KICKDOWN release (docs/RELEASE.md in the private renanjdev/kickdown).
 #
-# The private repo's release workflow builds the installer WITHOUT any secret, creates the DRAFT vX.Y.Z
-# here (unsigned installer + notes.md) and dispatches this workflow. The job runs in the "release"
+# The owner's scripts/release.mjs builds the installer on the owner's PC, WITHOUT any key, creates the
+# DRAFT vX.Y.Z here (unsigned installer + notes.md) with the owner's own `gh` and dispatches this workflow. The job runs in the "release"
 # environment: it waits until the owner approves it (GitHub Mobile › Review deployments), and only then
 # gets the signing key. It never checks out the private code: the only script it runs is
 # scripts/release-manifest.mjs, copied from the private repo.
@@ -9,22 +9,28 @@
 # No step prints a secret: no `set -x`, no echo of secret-derived values; the signer's output goes to
 # /dev/null.
 name: sign-publish
+# scripts/release.mjs finds its run by this title.
+run-name: sign-publish ${{ inputs.tag }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Versão (x.y.z)"
+        description: "Versão (x.y.z, ou x.y.z-sufixo numa pre-release)"
         required: true
         type: string
       tag:
-        description: "Tag (vX.Y.Z)"
+        description: "Tag (v + versão)"
         required: true
         type: string
       tauri_cli:
         description: "Versão do @tauri-apps/cli usada no build"
         required: true
         type: string
+      prerelease:
+        description: "Teste: publica como pre-release, nunca como latest (o app não a vê)"
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -44,6 +50,7 @@ jobs:
       VERSION: ${{ inputs.version }}
       TAG: ${{ inputs.tag }}
       TAURI_CLI: ${{ inputs.tauri_cli }}
+      PRERELEASE: ${{ inputs.prerelease }}
       REPO: ${{ github.repository }}
       # The app's updater pubkey (src-tauri/tauri.conf.json › plugins.updater.pubkey in the private repo).
       UPDATER_PUBKEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFREUwRkZFRDU0NUZBNDgKUldSSStrWFYvZy9lanN0blBIc2oxQnhtOXBHMVFNbDgyTkxDL2Jvelh3VEUycDMwTGRlT0dST3MK
@@ -52,7 +59,10 @@ jobs:
         run: |
           set -euo pipefail
           semver='^[0-9]+\.[0-9]+\.[0-9]+$'
-          if ! [[ "$VERSION" =~ $semver ]]; then echo "::error::version inválida"; exit 1; fi
+          suffixed='^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$'
+          if [[ "$VERSION" =~ $suffixed ]]; then
+            if [ "$PRERELEASE" != "true" ]; then echo "::error::versão com sufixo só como pre-release"; exit 1; fi
+          elif ! [[ "$VERSION" =~ $semver ]]; then echo "::error::version inválida"; exit 1; fi
           if [ "$TAG" != "v$VERSION" ]; then echo "::error::tag $TAG ≠ v$VERSION"; exit 1; fi
           if ! [[ "$TAURI_CLI" =~ $semver ]]; then echo "::error::tauri_cli inválida"; exit 1; fi
           echo "INSTALLER=KICKDOWN_${VERSION}_x64-setup.exe" >> "$GITHUB_ENV"
@@ -70,8 +80,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          draft=$(gh release view "$TAG" -R "$REPO" --json isDraft --jq .isDraft)
+          read -r draft pre < <(gh release view "$TAG" -R "$REPO" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')
           if [ "$draft" != "true" ]; then echo "::error::$TAG não é um draft (já publicada?)"; exit 1; fi
+          if [ "$pre" != "$PRERELEASE" ]; then echo "::error::draft prerelease=$pre ≠ input prerelease=$PRERELEASE"; exit 1; fi
           mkdir -p dist
           gh release download "$TAG" -R "$REPO" -D dist -p "$INSTALLER" -p notes.md
           test -s "dist/$INSTALLER"
@@ -104,5 +115,9 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$TAG" -R "$REPO" "dist/$INSTALLER.sig" out/latest.json
-          gh release edit "$TAG" -R "$REPO" --draft=false --latest
+          if [ "$PRERELEASE" = "true" ]; then
+            gh release edit "$TAG" -R "$REPO" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$TAG" -R "$REPO" --draft=false --latest
+          fi
           echo "publicado: https://github.com/$REPO/releases/tag/$TAG"
