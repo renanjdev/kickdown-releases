@@ -1,16 +1,23 @@
 # Sign + publish a KICKDOWN release (docs/RELEASE.md in the private renanjdev/kickdown).
 #
 # The owner's scripts/release.mjs builds the installer on the owner's PC, WITHOUT any key, creates the
-# DRAFT vX.Y.Z here (unsigned installer + notes.md) with the owner's own `gh` and dispatches this workflow. The job runs in the "release"
-# environment: it waits until the owner approves it (GitHub Mobile › Review deployments), and only then
-# gets the signing key. It never checks out the private code: the only script it runs is
-# scripts/release-manifest.mjs, copied from the private repo.
+# DRAFT vX.Y.Z here (unsigned installer + notes.md) with the owner's own `gh` and dispatches this workflow
+# with the private commit and the installer's SHA-256. Two jobs:
+#   1. "conferir" (no environment, no secret) checks the inputs and that the draft's installer has exactly
+#      that SHA-256, and writes the full values in the run summary. A wrong draft never asks for approval.
+#   2. "assinar e publicar" runs in the "release" environment: it waits until the owner approves it
+#      (GitHub Mobile › Review deployments), checks the draft's SHA-256 AGAIN, and only then gets the key.
+# It never checks out the private code: the only scripts it runs are scripts/check-draft.sh and
+# scripts/release-manifest.mjs (a copy of the private repo's; release.mjs checks both blobs, and this
+# file's, at the run's head_sha before it asks for the approval).
 #
 # No step prints a secret: no `set -x`, no echo of secret-derived values; the signer's output goes to
 # /dev/null.
 name: sign-publish
-# scripts/release.mjs finds its run by this title.
-run-name: sign-publish ${{ inputs.tag }}
+# What the owner checks before approving: tag, private commit and the first 8 hex of the installer's
+# SHA-256 (expressions have no substring, so release.mjs passes them; check-draft.sh ties them to the full
+# values). scripts/release.mjs finds its run by this exact title.
+run-name: sign-publish ${{ inputs.tag }} · ${{ inputs.commit }} · sha256 ${{ inputs.sha256_short }}
 
 on:
   workflow_dispatch:
@@ -21,6 +28,18 @@ on:
         type: string
       tag:
         description: "Tag (v + versão)"
+        required: true
+        type: string
+      commit:
+        description: "Commit do privado (12 hex) de onde saiu o build"
+        required: true
+        type: string
+      sha256:
+        description: "SHA-256 do instalador compilado (64 hex); o draft tem de ter exatamente esses bytes"
+        required: true
+        type: string
+      sha256_short:
+        description: "Os 8 primeiros hex do sha256 (vão no título do run)"
         required: true
         type: string
       tauri_cli:
@@ -38,35 +57,45 @@ concurrency:
   group: sign-publish-${{ inputs.tag }}
   cancel-in-progress: false
 
+env:
+  VERSION: ${{ inputs.version }}
+  TAG: ${{ inputs.tag }}
+  COMMIT: ${{ inputs.commit }}
+  SHA256: ${{ inputs.sha256 }}
+  SHA256_SHORT: ${{ inputs.sha256_short }}
+  TAURI_CLI: ${{ inputs.tauri_cli }}
+  PRERELEASE: ${{ inputs.prerelease }}
+  REPO: ${{ github.repository }}
+
 jobs:
+  conferir:
+    name: conferir ${{ inputs.tag }} (antes da aprovação)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A draft is only visible to a token with push access. No secret, no environment here.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Conferir entradas e o SHA-256 do draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check-draft.sh
+
   sign-publish:
     name: assinar e publicar ${{ inputs.tag }}
+    needs: conferir
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: release
     permissions:
       contents: write
     env:
-      VERSION: ${{ inputs.version }}
-      TAG: ${{ inputs.tag }}
-      TAURI_CLI: ${{ inputs.tauri_cli }}
-      PRERELEASE: ${{ inputs.prerelease }}
-      REPO: ${{ github.repository }}
       # The app's updater pubkey (src-tauri/tauri.conf.json › plugins.updater.pubkey in the private repo).
       UPDATER_PUBKEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFREUwRkZFRDU0NUZBNDgKUldSSStrWFYvZy9lanN0blBIc2oxQnhtOXBHMVFNbDgyTkxDL2Jvelh3VEUycDMwTGRlT0dST3MK
     steps:
-      - name: Conferir entradas
-        run: |
-          set -euo pipefail
-          semver='^[0-9]+\.[0-9]+\.[0-9]+$'
-          suffixed='^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$'
-          if [[ "$VERSION" =~ $suffixed ]]; then
-            if [ "$PRERELEASE" != "true" ]; then echo "::error::versão com sufixo só como pre-release"; exit 1; fi
-          elif ! [[ "$VERSION" =~ $semver ]]; then echo "::error::version inválida"; exit 1; fi
-          if [ "$TAG" != "v$VERSION" ]; then echo "::error::tag $TAG ≠ v$VERSION"; exit 1; fi
-          if ! [[ "$TAURI_CLI" =~ $semver ]]; then echo "::error::tauri_cli inválida"; exit 1; fi
-          echo "INSTALLER=KICKDOWN_${VERSION}_x64-setup.exe" >> "$GITHUB_ENV"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -74,19 +103,11 @@ jobs:
         with:
           node-version: "22"
 
-      # Only a draft is signed: a published release is never touched again.
-      - name: Baixar o draft
+      # Again, after the approval and right before signing: the draft must still be those exact bytes.
+      - name: Baixar o draft e conferir o SHA-256
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          read -r draft pre < <(gh release view "$TAG" -R "$REPO" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')
-          if [ "$draft" != "true" ]; then echo "::error::$TAG não é um draft (já publicada?)"; exit 1; fi
-          if [ "$pre" != "$PRERELEASE" ]; then echo "::error::draft prerelease=$pre ≠ input prerelease=$PRERELEASE"; exit 1; fi
-          mkdir -p dist
-          gh release download "$TAG" -R "$REPO" -D dist -p "$INSTALLER" -p notes.md
-          test -s "dist/$INSTALLER"
-          if [ -z "$(tr -d '[:space:]' < dist/notes.md)" ]; then echo "::error::o draft $TAG não tem notas"; exit 1; fi
+        run: bash scripts/check-draft.sh
 
       # Only the Tauri CLI (the same version the build used), without install scripts, in an empty
       # folder: the key is exposed to this binary and nothing else.
